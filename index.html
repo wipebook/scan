@@ -66,7 +66,6 @@
     octx.fillStyle='rgba(0,255,150,.9)'; for(const c of quad){ octx.beginPath(); octx.arc(c.x,c.y,4,0,Math.PI*2); octx.fill(); }
   }
 
-  // Using your working coordinate mapping function. This is key.
   function procToScreen(px, py){
     const vw = overlay.width, vh = overlay.height;
     const vidW = video.videoWidth, vidH = video.videoHeight;
@@ -78,8 +77,6 @@
     const sy = oy + (py/PROC_H) * (vidH*scale);
     return { x: sx, y: sy };
   }
-
-  // DETECTION LOGIC: DEFAULT QUAD + GUIDED REFINEMENT
 
   function harrisCorners(gray, W, H) {
       const corners = [];
@@ -134,14 +131,13 @@
   }
 
   function refineQuadWithCorners(initialQuad, corners) {
-      const refinedQuad = initialQuad.map(p => ({...p})); // Make a copy
-      const SEARCH_RADIUS = PROC_W * 0.3; // Increased search radius
+      const refinedQuad = initialQuad.map(p => ({...p}));
+      const SEARCH_RADIUS = PROC_W * 0.3;
 
       for (let i = 0; i < 4; i++) {
           const defaultCorner = initialQuad[i];
           let bestCandidate = defaultCorner;
           let bestScore = -1;
-
           for (const p of corners) {
               const dist = Math.hypot(p.x - defaultCorner.x, p.y - defaultCorner.y);
               if (dist < SEARCH_RADIUS && p.score > bestScore) {
@@ -157,40 +153,31 @@
   function processFrame(){
     const vw = video.videoWidth, vh = video.videoHeight; if(!vw||!vh) { requestAnimationFrame(processFrame); return; }
     resizeOverlay();
-
     PROC_H = Math.round(PROC_W * vh / vw);
     if(proc.width !== PROC_W || proc.height !== PROC_H){
       proc.width = PROC_W; proc.height = PROC_H;
     }
-
     pctx.drawImage(video, 0, 0, PROC_W, PROC_H);
-
     const frame = pctx.getImageData(0,0,PROC_W,PROC_H);
     const data = frame.data; const gray = new Uint8ClampedArray(PROC_W*PROC_H);
     for(let i=0,j=0;i<data.length;i+=4,j++){ gray[j] = (0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2])|0; }
-
     const defaultQuad = createDefaultQuad(PROC_W, PROC_H);
     const corners = harrisCorners(gray, PROC_W, PROC_H);
     const ptsProc = refineQuadWithCorners(defaultQuad, corners);
-    
     const quad = ptsProc.map(p => procToScreen(p.x, p.y));
-
     if(lastQuad){ for(let i=0;i<4;i++){ quad[i] = { x: lerp(lastQuad[i].x, quad[i].x, 0.4), y: lerp(lastQuad[i].y, quad[i].y, 0.4) }; } }
-    
     let diff = 0;
     const defaultScreenQuad = defaultQuad.map(p => procToScreen(p.x, p.y));
     for (let i=0; i<4; i++) { diff += Math.hypot(quad[i].x - defaultScreenQuad[i].x, quad[i].y - defaultScreenQuad[i].y); }
-    
     if (diff > 20) { stableFrames = Math.min(stableFrames + 1, 60); }
     else { stableFrames = Math.max(0, stableFrames - 1); }
-    
     statusEl.textContent = stableFrames > 5 ? 'Locked' : 'Detecting…'; 
     lastQuad = quad;
     drawOverlay(lastQuad);
     requestAnimationFrame(processFrame);
   }
 
-  // YOUR WORKING CAPTURE & DOWNLOAD LOGIC
+  // CAPTURE BUTTON LOGIC -- MODIFIED FOR HIGH RESOLUTION
   captureBtn.addEventListener('click', () => {
     if(!lastQuad){ showToast('No page detected'); return; }
 
@@ -214,8 +201,24 @@
       let h=Array(9).fill(1); for(let it=0;it<3;it++){ const b=h.slice(); const M=ATA.map((row,i)=> row.map((v,j)=> v + (i===j?1e-6:0))); h=solve(M,b); const norm=Math.hypot(...h); h=h.map(v=>v/norm); } h=h.map(v=>v/(h[8]||1e-12)); return h; }
       function invert3(m){ const [a,b,c,d,e,f,g,h,i]=m; const A=e*i-f*h, B=-(d*i-f*g), C=d*h-e*g, D=-(b*i-c*h), E=a*i-c*g, F=-(a*h-b*g), G=b*f-c*e, H=-(a*f-c*d), I=a*e-b*d; const det=a*A+b*B+c*C; const inv=1/(det||1e-12); return [A*inv,D*inv,G*inv,B*inv,E*inv,H*inv,C*inv,F*inv,I*inv]; }
 
-    const outW = Math.max(256, Math.round((Math.hypot(srcQuadFull[1].x-srcQuadFull[0].x, srcQuadFull[1].y-srcQuadFull[0].y) + Math.hypot(srcQuadFull[2].x-srcQuadFull[3].x, srcQuadFull[2].y-srcQuadFull[3].y))/2));
-    const outH = Math.max(256, Math.round((Math.hypot(srcQuadFull[2].x-srcQuadFull[1].x, srcQuadFull[2].y-srcQuadFull[1].y) + Math.hypot(srcQuadFull[3].x-srcQuadFull[0].x, srcQuadFull[3].y-srcQuadFull[0].y))/2));
+    // +++ NEW HIGH-RESOLUTION LOGIC +++
+    // 1. Calculate the average width and height of the detected document in the full-res image
+    const avgW = (Math.hypot(srcQuadFull[1].x - srcQuadFull[0].x, srcQuadFull[1].y - srcQuadFull[0].y) + Math.hypot(srcQuadFull[2].x - srcQuadFull[3].x, srcQuadFull[2].y - srcQuadFull[3].y))/2;
+    const avgH = (Math.hypot(srcQuadFull[2].x - srcQuadFull[1].x, srcQuadFull[2].y - srcQuadFull[1].y) + Math.hypot(srcQuadFull[3].x - srcQuadFull[0].x, srcQuadFull[3].y - srcQuadFull[0].y))/2;
+
+    // 2. Define a target size for the output image's longest side
+    const TARGET_LONGEST_SIDE = 1500; // You can increase this for even higher resolution
+
+    // 3. Calculate final output dimensions while preserving aspect ratio
+    let outW, outH;
+    if (avgW > avgH) { // Landscape
+        outW = TARGET_LONGEST_SIDE;
+        outH = Math.round(TARGET_LONGEST_SIDE * (avgH / avgW));
+    } else { // Portrait
+        outH = TARGET_LONGEST_SIDE;
+        outW = Math.round(TARGET_LONGEST_SIDE * (avgW / avgH));
+    }
+    // --- END of new logic ---
 
     crop.width=outW; crop.height=outH; const dctx=crop.getContext('2d'); const dimg=dctx.createImageData(outW,outH);
     const Hsd = computeHomography(srcQuadFull, [{x:0,y:0},{x:outW-1,y:0},{x:outW-1,y:outH-1},{x:0,y:outH-1}]);
@@ -227,7 +230,7 @@
     }
     dctx.putImageData(dimg,0,0);
 
-    crop.toBlob(b=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=`crop-${Date.now()}.jpg`; a.click(); URL.revokeObjectURL(a.href); }, 'image/jpeg', 0.95);
+    crop.toBlob(b=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=`scan-${Date.now()}.jpg`; a.click(); URL.revokeObjectURL(a.href); }, 'image/jpeg', 0.92);
   });
 
   (async function init(){
