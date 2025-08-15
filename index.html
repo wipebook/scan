@@ -13,21 +13,15 @@
     #capture { position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); width: 72px; height: 72px; border-radius: 999px; border: 6px solid #eee; background: rgba(255,255,255,0.06); box-shadow: 0 0 0 2px rgba(255,255,255,.15) inset; cursor: pointer; transition: background 0.2s; }
     #toast { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%); color: #fff; background: #d9534f; padding: 8px 12px; border-radius: 8px; display:none; font-family: system-ui; font-size: 12px; }
 
-    /* +++ NEW CSS FOR THE LOADING ANIMATION +++ */
     #capture:disabled {
         cursor: not-allowed;
         opacity: 0.8;
     }
     #capture.loading {
-        /* This creates the clock-wipe effect.
-           Layer 1: A dark inner circle to maintain the button's look.
-           Layer 2: The conic gradient that fills up based on the --progress variable. */
         background: 
             radial-gradient(circle at center, rgba(0,0,0,0.5) 0% 78%, transparent 78% 100%),
             conic-gradient(#fff var(--progress, 0%), rgba(255,255,255,0.06) 0);
     }
-    /* --- End of new CSS --- */
-
   </style>
 </head>
 <body>
@@ -193,28 +187,36 @@
     requestAnimationFrame(processFrame);
   }
 
-  // --- MODIFIED CAPTURE BUTTON LOGIC WITH ANIMATION ---
-  let animationFrameId = null;
-
-  captureBtn.addEventListener('click', () => {
-    if(!lastQuad){ showToast('No page detected'); return; }
+  // --- REFACTORED CAPTURE BUTTON LOGIC WITH GUARANTEED ANIMATION ---
+  captureBtn.addEventListener('click', async () => {
+    if(!lastQuad || captureBtn.disabled){ showToast('No page detected'); return; }
     
-    // Start the animation
     captureBtn.disabled = true;
     captureBtn.classList.add('loading');
     
-    let progress = 0;
-    const animate = () => {
-        progress += 0.015; // Animation speed
-        // Animate quickly to 95% and then hold, waiting for the process to finish
-        const displayProgress = Math.min(progress, 0.95);
-        captureBtn.style.setProperty('--progress', `${displayProgress * 100}%`);
-        animationFrameId = requestAnimationFrame(animate);
-    };
-    animate();
+    let animationFrameId = null;
 
-    // Use setTimeout to allow the UI to update with the loading state before heavy work
-    setTimeout(() => {
+    // This Promise handles the animation, ensuring it runs for a minimum duration
+    const animatePromise = new Promise(resolve => {
+        const MIN_DURATION = 600; // 600ms minimum animation time
+        let startTime = performance.now();
+        
+        const animate = (now) => {
+            const elapsed = now - startTime;
+            const progress = Math.min(elapsed / MIN_DURATION, 1);
+            captureBtn.style.setProperty('--progress', `${progress * 100}%`);
+            
+            if (progress < 1) {
+                animationFrameId = requestAnimationFrame(animate);
+            } else {
+                resolve(); // Animation finished
+            }
+        };
+        animationFrameId = requestAnimationFrame(animate);
+    });
+
+    // This Promise handles the image processing
+    const processPromise = new Promise((resolve, reject) => {
         try {
             function screenToProc(sx, sy){
               const vw = overlay.width, vh = overlay.height; const vidW=video.videoWidth, vidH=video.videoHeight; const vidAR=vidW/vidH, viewAR=vw/vh; let scale, ox=0, oy=0;
@@ -222,27 +224,22 @@
               const vx = (sx - ox) / scale; const vy = (sy - oy) / scale;
               return { x: vx * (PROC_W/vidW), y: vy * (PROC_H/vidH) };
             }
-
             const srcQuadProc = lastQuad.map(p=> screenToProc(p.x,p.y));
-
             const temp = document.createElement('canvas'); temp.width=video.videoWidth; temp.height=video.videoHeight; const tctx=temp.getContext('2d'); tctx.drawImage(video,0,0);
             const scaleX = temp.width/PROC_W, scaleY=temp.height/PROC_H;
             const srcQuadFull = srcQuadProc.map(p=> ({ x:p.x*scaleX, y:p.y*scaleY }));
-
             function computeHomography(src, dst){
               const A=[]; for(let i=0;i<4;i++){ const xs=src[i].x, ys=src[i].y, xd=dst[i].x, yd=dst[i].y; A.push([-xs,-ys,-1,0,0,0,xs*xd,ys*xd,xd]); A.push([0,0,0,-xs,-ys,-1,xs*yd,ys*yd,yd]); }
               const ATA=Array.from({length:9},()=>Array(9).fill(0)); for(let r=0;r<8;r++) for(let c=0;c<9;c++) for(let k=0;k<9;k++) ATA[c][k]+=A[r][c]*A[r][k];
               function solve(M,b){ const n=M.length,a=M.map(r=>r.slice()),x=b.slice(); for(let i=0;i<n;i++){ let m=i; for(let j=i+1;j<n;j++) if(Math.abs(a[j][i])>Math.abs(a[m][i])) m=j; [a[i],a[m]]=[a[m],a[i]]; [x[i],x[m]]=[x[m],x[i]]; const piv=a[i][i]||1e-12; for(let j=i+1;j<n;j++){ const f=a[j][i]/piv; if(!f||!isFinite(f)) continue; for(let k=i;k<n;k++) a[j][k]-=f*a[i][k]; x[j]-=f*x[i]; } } const res=Array(n).fill(0); for(let i=n-1;i>=0;i--){ let s=x[i]; for(let k=i+1;k<n;k++) s-=a[i][k]*res[k]; res[i]=s/(a[i][i]||1e-12);} return res; }
               let h=Array(9).fill(1); for(let it=0;it<3;it++){ const b=h.slice(); const M=ATA.map((row,i)=> row.map((v,j)=> v + (i===j?1e-6:0))); h=solve(M,b); const norm=Math.hypot(...h); h=h.map(v=>v/norm); } h=h.map(v=>v/(h[8]||1e-12)); return h; }
               function invert3(m){ const [a,b,c,d,e,f,g,h,i]=m; const A=e*i-f*h, B=-(d*i-f*g), C=d*h-e*g, D=-(b*i-c*h), E=a*i-c*g, F=-(a*h-b*g), G=b*f-c*e, H=-(a*f-c*d), I=a*e-b*d; const det=a*A+b*B+c*C; const inv=1/(det||1e-12); return [A*inv,D*inv,G*inv,B*inv,E*inv,H*inv,C*inv,F*inv,I*inv]; }
-
             const avgW = (Math.hypot(srcQuadFull[1].x - srcQuadFull[0].x, srcQuadFull[1].y - srcQuadFull[0].y) + Math.hypot(srcQuadFull[2].x - srcQuadFull[3].x, srcQuadFull[2].y - srcQuadFull[3].y))/2;
             const avgH = (Math.hypot(srcQuadFull[2].x - srcQuadFull[1].x, srcQuadFull[2].y - srcQuadFull[1].y) + Math.hypot(srcQuadFull[3].x - srcQuadFull[0].x, srcQuadFull[3].y - srcQuadFull[0].y))/2;
             const TARGET_LONGEST_SIDE = 1500;
             let outW, outH;
             if (avgW > avgH) { outW = TARGET_LONGEST_SIDE; outH = Math.round(TARGET_LONGEST_SIDE * (avgH / avgW)); }
             else { outH = TARGET_LONGEST_SIDE; outW = Math.round(TARGET_LONGEST_SIDE * (avgW / avgH)); }
-
             crop.width=outW; crop.height=outH; const dctx=crop.getContext('2d'); const dimg=dctx.createImageData(outW,outH);
             const Hsd = computeHomography(srcQuadFull, [{x:0,y:0},{x:outW-1,y:0},{x:outW-1,y:outH-1},{x:0,y:outH-1}]);
             const Hds = invert3(Hsd);
@@ -252,21 +249,23 @@
               const ix=Math.floor(sx), iy=Math.floor(sy); if(ix>=0&&iy>=0&&ix<sw-1&&iy<sh-1){ const dx=sx-ix, dy=sy-iy; const i00=(iy*sw+ix)*4, i10=i00+4, i01=i00+sw*4, i11=i01+4; for(let c=0;c<3;c++) dp[(y*outW+x)*4+c] = sp[i00+c]*(1-dx)*(1-dy) + sp[i10+c]*dx*(1-dy) + sp[i01+c]*(1-dx)*dy + sp[i11+c]*dx*dy; dp[(y*outW+x)*4+3]=255; }
             }
             dctx.putImageData(dimg,0,0);
-
-            crop.toBlob(b=>{ 
-                const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=`scan-${Date.now()}.jpg`; a.click(); URL.revokeObjectURL(a.href);
-            }, 'image/jpeg', 0.92);
-        } catch(e) {
-            console.error(e);
-            showToast('Image processing failed.');
-        } finally {
-            // This block runs whether the process succeeded or failed
-            cancelAnimationFrame(animationFrameId);
-            captureBtn.classList.remove('loading');
-            captureBtn.style.setProperty('--progress', '0%');
-            captureBtn.disabled = false;
-        }
-    }, 20); // 20ms delay
+            crop.toBlob(b=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=`scan-${Date.now()}.jpg`; a.click(); URL.revokeObjectURL(a.href); resolve(); }, 'image/jpeg', 0.92);
+        } catch(e) { reject(e); }
+    });
+    
+    try {
+        // Wait for both the minimum animation time AND the processing to finish
+        await Promise.all([animatePromise, processPromise]);
+    } catch(e) {
+        console.error(e);
+        showToast('Image processing failed.');
+    } finally {
+        // This now runs only after both promises are settled
+        cancelAnimationFrame(animationFrameId);
+        captureBtn.classList.remove('loading');
+        captureBtn.style.setProperty('--progress', '0%');
+        captureBtn.disabled = false;
+    }
   });
 
   (async function init(){
