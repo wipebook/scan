@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Edge-Tracking Camera (Final)</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+    #overlay { pointer-events: none; }
+    #status { position: absolute; bottom: 110px; left: 50%; transform: translateX(-50%); color: #fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; font-size: 14px; background: rgba(0,0,0,.45); padding: 6px 10px; border-radius: 8px; }
+    #capture { position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); width: 72px; height: 72px; border-radius: 999px; border: 6px solid #eee; background: rgba(255,255,255,0.06); box-shadow: 0 0 0 2px rgba(255,255,255,.15) inset; cursor: pointer; }
+    #toast { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%); color: #fff; background: #d9534f; padding: 8px 12px; border-radius: 8px; display:none; font-family: system-ui; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+  <div id="status">Initializing…</div>
+  <button id="capture" title="Capture & Download"></button>
+  <div id="toast"></div>
+
+  <!-- Hidden canvases for processing and crop -->
+  <canvas id="proc" style="display:none;"></canvas>
+  <canvas id="crop" style="display:none;"></canvas>
+
+<script>
+'use strict';
+(function(){
+  const video = document.getElementById('video');
+  const overlay = document.getElementById('overlay');
+  const octx = overlay.getContext('2d');
+  const proc = document.getElementById('proc');
+  const pctx = proc.getContext('2d', { willReadFrequently: true });
+  const crop = document.getElementById('crop');
+  const statusEl = document.getElementById('status');
+  const toast = document.getElementById('toast');
+  const captureBtn = document.getElementById('capture');
+
+  function showToast(msg){
+    toast.textContent = msg; toast.style.display='block';
+    clearTimeout(showToast._t); showToast._t = setTimeout(()=> toast.style.display='none', 2600);
+  }
+
+  function resizeOverlay(){
+    const r = overlay.getBoundingClientRect();
+    overlay.width = Math.round(r.width);
+    overlay.height = Math.round(r.height);
+  }
+  addEventListener('resize', resizeOverlay);
+
+  const PROC_W = 320;
+  let PROC_H = 240;
+
+  let lastQuad = null;
+  let stableFrames = 0;
+
+  function lerp(a,b,t){ return a + (b-a)*t; }
+  
+  function drawOverlay(quad){
+    octx.clearRect(0,0,overlay.width,overlay.height);
+    if (!quad) return;
+    octx.lineWidth = 3; octx.strokeStyle='rgba(0,200,255,.95)'; octx.fillStyle='rgba(0,200,255,.12)';
+    octx.beginPath(); octx.moveTo(quad[0].x, quad[0].y); for(let i=1;i<4;i++) octx.lineTo(quad[i].x, quad[i].y); octx.closePath(); octx.stroke(); octx.fill();
+    octx.fillStyle='rgba(0,255,150,.9)'; for(const c of quad){ octx.beginPath(); octx.arc(c.x,c.y,4,0,Math.PI*2); octx.fill(); }
+  }
+
+  // Using your working coordinate mapping function. This is key.
+  function procToScreen(px, py){
+    const vw = overlay.width, vh = overlay.height;
+    const vidW = video.videoWidth, vidH = video.videoHeight;
+    const vidAR = vidW/vidH, viewAR = vw/vh;
+    let scale, ox=0, oy=0;
+    if (vidAR > viewAR){ scale = vh/vidH; ox = (vw - vidW*scale)/2; }
+    else { scale = vw/vidW; oy = (vh - vidH*scale)/2; }
+    const sx = ox + (px/PROC_W) * (vidW*scale);
+    const sy = oy + (py/PROC_H) * (vidH*scale);
+    return { x: sx, y: sy };
+  }
+
+  // DETECTION LOGIC: DEFAULT QUAD + GUIDED REFINEMENT
+
+  function harrisCorners(gray, W, H) {
+      const corners = [];
+      const R = new Float32Array(W * H);
+      const K = 0.05;
+      const THRESHOLD = 250;
+
+      const Ix = new Float32Array(W*H), Iy = new Float32Array(W*H);
+      for (let y=1; y<H-1; y++) for (let x=1; x<W-1; x++) {
+          const gx = (gray[(y-1)*(W)+(x+1)] + 2*gray[y*W+(x+1)] + gray[(y+1)*W+(x+1)]) - (gray[(y-1)*(W)+(x-1)] + 2*gray[y*W+(x-1)] + gray[(y+1)*W+(x-1)]);
+          const gy = (gray[(y+1)*(W)+(x-1)] + 2*gray[(y+1)*W+x] + gray[(y+1)*W+(x+1)]) - (gray[(y-1)*(W)+(x-1)] + 2*gray[(y-1)*W+x] + gray[(y-1)*W+(x+1)]);
+          Ix[y*W+x] = gx; Iy[y*W+x] = gy;
+      }
+
+      const Ixx = new Float32Array(W*H), Iyy = new Float32Array(W*H), Ixy = new Float32Array(W*H);
+      for (let i=0; i<W*H; i++) { Ixx[i] = Ix[i]*Ix[i]; Iyy[i] = Iy[i]*Iy[i]; Ixy[i] = Ix[i]*Iy[i]; }
+
+      const Sxx = new Float32Array(W*H), Syy = new Float32Array(W*H), Sxy = new Float32Array(W*H);
+      const WIN_SIZE = 5, WIN_HALF = Math.floor(WIN_SIZE/2);
+      for (let y=WIN_HALF; y<H-WIN_HALF; y++) for (let x=WIN_HALF; x<W-WIN_HALF; x++) {
+          let sxx=0, syy=0, sxy=0;
+          for(let wy=-WIN_HALF; wy<=WIN_HALF; wy++) for(let wx=-WIN_HALF; wx<=WIN_HALF; wx++) {
+              const i = (y+wy)*W + (x+wx); sxx += Ixx[i]; syy += Iyy[i]; sxy += Ixy[i];
+          }
+          Sxx[y*W+x] = sxx; Syy[y*W+x] = syy; Sxy[y*W+x] = sxy;
+      }
+
+      for (let i=0; i<W*H; i++) {
+          const det = (Sxx[i]*Syy[i]) - (Sxy[i]*Sxy[i]);
+          const trace = Sxx[i] + Syy[i];
+          R[i] = det - K * (trace*trace);
+      }
+      
+      for (let y=1; y<H-1; y++) for (let x=1; x<W-1; x++) {
+          const score = R[y*W+x];
+          if (score > THRESHOLD) {
+              let isMax = true;
+              for (let ny=-1; ny<=1; ny++) { for (let nx=-1; nx<=1; nx++) if (R[(y+ny)*W+(x+nx)] > score) { isMax=false; break; } if(!isMax) break; }
+              if (isMax) corners.push({ x:x, y:y, score:score });
+          }
+      }
+      return corners;
+  }
+  
+  function createDefaultQuad(W, H) {
+      const paddingX = W * 0.125;
+      const paddingY = H * 0.125;
+      return [
+        { x: paddingX, y: paddingY }, { x: W-paddingX, y: paddingY },
+        { x: W-paddingX, y: H-paddingY }, { x: paddingX, y: H-paddingY }
+      ];
+  }
+
+  function refineQuadWithCorners(initialQuad, corners) {
+      const refinedQuad = initialQuad.map(p => ({...p})); // Make a copy
+      const SEARCH_RADIUS = PROC_W * 0.3; // Increased search radius
+
+      for (let i = 0; i < 4; i++) {
+          const defaultCorner = initialQuad[i];
+          let bestCandidate = defaultCorner;
+          let bestScore = -1;
+
+          for (const p of corners) {
+              const dist = Math.hypot(p.x - defaultCorner.x, p.y - defaultCorner.y);
+              if (dist < SEARCH_RADIUS && p.score > bestScore) {
+                  bestScore = p.score;
+                  bestCandidate = p;
+              }
+          }
+          refinedQuad[i] = bestCandidate;
+      }
+      return refinedQuad;
+  }
+
+  function processFrame(){
+    const vw = video.videoWidth, vh = video.videoHeight; if(!vw||!vh) { requestAnimationFrame(processFrame); return; }
+    resizeOverlay();
+
+    PROC_H = Math.round(PROC_W * vh / vw);
+    if(proc.width !== PROC_W || proc.height !== PROC_H){
+      proc.width = PROC_W; proc.height = PROC_H;
+    }
+
+    pctx.drawImage(video, 0, 0, PROC_W, PROC_H);
+
+    const frame = pctx.getImageData(0,0,PROC_W,PROC_H);
+    const data = frame.data; const gray = new Uint8ClampedArray(PROC_W*PROC_H);
+    for(let i=0,j=0;i<data.length;i+=4,j++){ gray[j] = (0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2])|0; }
+
+    const defaultQuad = createDefaultQuad(PROC_W, PROC_H);
+    const corners = harrisCorners(gray, PROC_W, PROC_H);
+    const ptsProc = refineQuadWithCorners(defaultQuad, corners);
+    
+    const quad = ptsProc.map(p => procToScreen(p.x, p.y));
+
+    if(lastQuad){ for(let i=0;i<4;i++){ quad[i] = { x: lerp(lastQuad[i].x, quad[i].x, 0.4), y: lerp(lastQuad[i].y, quad[i].y, 0.4) }; } }
+    
+    let diff = 0;
+    const defaultScreenQuad = defaultQuad.map(p => procToScreen(p.x, p.y));
+    for (let i=0; i<4; i++) { diff += Math.hypot(quad[i].x - defaultScreenQuad[i].x, quad[i].y - defaultScreenQuad[i].y); }
+    
+    if (diff > 20) { stableFrames = Math.min(stableFrames + 1, 60); }
+    else { stableFrames = Math.max(0, stableFrames - 1); }
+    
+    statusEl.textContent = stableFrames > 5 ? 'Locked' : 'Detecting…'; 
+    lastQuad = quad;
+    drawOverlay(lastQuad);
+    requestAnimationFrame(processFrame);
+  }
+
+  // YOUR WORKING CAPTURE & DOWNLOAD LOGIC
+  captureBtn.addEventListener('click', () => {
+    if(!lastQuad){ showToast('No page detected'); return; }
+
+    function screenToProc(sx, sy){
+      const vw = overlay.width, vh = overlay.height; const vidW=video.videoWidth, vidH=video.videoHeight; const vidAR=vidW/vidH, viewAR=vw/vh; let scale, ox=0, oy=0;
+      if(vidAR>viewAR){ scale = vh/vidH; ox=(vw-vidW*scale)/2; } else { scale = vw/vidW; oy=(vh-vidH*scale)/2; }
+      const vx = (sx - ox) / scale; const vy = (sy - oy) / scale;
+      return { x: vx * (PROC_W/vidW), y: vy * (PROC_H/vidH) };
+    }
+
+    const srcQuadProc = lastQuad.map(p=> screenToProc(p.x,p.y));
+
+    const temp = document.createElement('canvas'); temp.width=video.videoWidth; temp.height=video.videoHeight; const tctx=temp.getContext('2d'); tctx.drawImage(video,0,0);
+    const scaleX = temp.width/PROC_W, scaleY=temp.height/PROC_H;
+    const srcQuadFull = srcQuadProc.map(p=> ({ x:p.x*scaleX, y:p.y*scaleY }));
+
+    function computeHomography(src, dst){
+      const A=[]; for(let i=0;i<4;i++){ const xs=src[i].x, ys=src[i].y, xd=dst[i].x, yd=dst[i].y; A.push([-xs,-ys,-1,0,0,0,xs*xd,ys*xd,xd]); A.push([0,0,0,-xs,-ys,-1,xs*yd,ys*yd,yd]); }
+      const ATA=Array.from({length:9},()=>Array(9).fill(0)); for(let r=0;r<8;r++) for(let c=0;c<9;c++) for(let k=0;k<9;k++) ATA[c][k]+=A[r][c]*A[r][k];
+      function solve(M,b){ const n=M.length,a=M.map(r=>r.slice()),x=b.slice(); for(let i=0;i<n;i++){ let m=i; for(let j=i+1;j<n;j++) if(Math.abs(a[j][i])>Math.abs(a[m][i])) m=j; [a[i],a[m]]=[a[m],a[i]]; [x[i],x[m]]=[x[m],x[i]]; const piv=a[i][i]||1e-12; for(let j=i+1;j<n;j++){ const f=a[j][i]/piv; if(!f||!isFinite(f)) continue; for(let k=i;k<n;k++) a[j][k]-=f*a[i][k]; x[j]-=f*x[i]; } } const res=Array(n).fill(0); for(let i=n-1;i>=0;i--){ let s=x[i]; for(let k=i+1;k<n;k++) s-=a[i][k]*res[k]; res[i]=s/(a[i][i]||1e-12);} return res; }
+      let h=Array(9).fill(1); for(let it=0;it<3;it++){ const b=h.slice(); const M=ATA.map((row,i)=> row.map((v,j)=> v + (i===j?1e-6:0))); h=solve(M,b); const norm=Math.hypot(...h); h=h.map(v=>v/norm); } h=h.map(v=>v/(h[8]||1e-12)); return h; }
+      function invert3(m){ const [a,b,c,d,e,f,g,h,i]=m; const A=e*i-f*h, B=-(d*i-f*g), C=d*h-e*g, D=-(b*i-c*h), E=a*i-c*g, F=-(a*h-b*g), G=b*f-c*e, H=-(a*f-c*d), I=a*e-b*d; const det=a*A+b*B+c*C; const inv=1/(det||1e-12); return [A*inv,D*inv,G*inv,B*inv,E*inv,H*inv,C*inv,F*inv,I*inv]; }
+
+    const outW = Math.max(256, Math.round((Math.hypot(srcQuadFull[1].x-srcQuadFull[0].x, srcQuadFull[1].y-srcQuadFull[0].y) + Math.hypot(srcQuadFull[2].x-srcQuadFull[3].x, srcQuadFull[2].y-srcQuadFull[3].y))/2));
+    const outH = Math.max(256, Math.round((Math.hypot(srcQuadFull[2].x-srcQuadFull[1].x, srcQuadFull[2].y-srcQuadFull[1].y) + Math.hypot(srcQuadFull[3].x-srcQuadFull[0].x, srcQuadFull[3].y-srcQuadFull[0].y))/2));
+
+    crop.width=outW; crop.height=outH; const dctx=crop.getContext('2d'); const dimg=dctx.createImageData(outW,outH);
+    const Hsd = computeHomography(srcQuadFull, [{x:0,y:0},{x:outW-1,y:0},{x:outW-1,y:outH-1},{x:0,y:outH-1}]);
+    const Hds = invert3(Hsd);
+    const sctx=temp.getContext('2d', { willReadFrequently: true }); const sw=temp.width, sh=temp.height; const simg=sctx.getImageData(0,0,sw,sh); const sp=simg.data; const dp=dimg.data;
+    for(let y=0;y<outH;y++) for(let x=0;x<outW;x++){
+      const X=Hds[0]*x + Hds[1]*y + Hds[2]; const Y=Hds[3]*x + Hds[4]*y + Hds[5]; const Z=Hds[6]*x + Hds[7]*y + Hds[8]; const sx=X/Z, sy=Y/Z;
+      const ix=Math.floor(sx), iy=Math.floor(sy); if(ix>=0&&iy>=0&&ix<sw-1&&iy<sh-1){ const dx=sx-ix, dy=sy-iy; const i00=(iy*sw+ix)*4, i10=i00+4, i01=i00+sw*4, i11=i01+4; for(let c=0;c<3;c++) dp[(y*outW+x)*4+c] = sp[i00+c]*(1-dx)*(1-dy) + sp[i10+c]*dx*(1-dy) + sp[i01+c]*(1-dx)*dy + sp[i11+c]*dx*dy; dp[(y*outW+x)*4+3]=255; }
+    }
+    dctx.putImageData(dimg,0,0);
+
+    crop.toBlob(b=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=`crop-${Date.now()}.jpg`; a.click(); URL.revokeObjectURL(a.href); }, 'image/jpeg', 0.95);
+  });
+
+  (async function init(){
+    try{
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio:false });
+      video.srcObject = stream;
+      await new Promise(res => video.addEventListener('loadedmetadata', res, { once: true }));
+      video.play();
+      resizeOverlay();
+      statusEl.textContent='Detecting…';
+      requestAnimationFrame(processFrame);
+    }catch(e){ statusEl.textContent='Camera error'; console.error(e); showToast('Camera access denied/unavailable'); }
+  })();
+})();
+</script>
+</body>
+</html>
